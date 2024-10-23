@@ -1,0 +1,262 @@
+trigger:
+  batch: true
+  branches:
+    include:
+    - develop
+    - release
+    - master
+
+variables:
+  ASPNETCORE_ENVIRONMENT: 'Local'
+  buildConfiguration: 'Release'
+  dotNetCoreVersion: '3.1.403'
+
+pr: none
+
+stages:
+- stage: Build
+  jobs:
+    - job:
+      pool:
+        vmImage: 'windows-2019'
+      steps:
+      - checkout: self
+        clean: false
+
+      - task: DotNetCoreInstaller@0
+        displayName: Ensure .NET Core $(dotNetCoreVersion) SDK Present
+        inputs:
+          packageType: 'sdk'
+          version: $(dotNetCoreVersion)
+
+      #- task: PowerShell@2
+      #  displayName: Downgrade GitVersion to the last one working for us
+      #  inputs:
+      #    targetType: inline
+      #    script: choco install gitversion.portable --version 5.1.3.0 --allow-downgrade
+
+      #- task: GitVersion@5
+      #  displayName: Git Version
+      #  inputs:
+      #    updateAssemblyInfo: false
+          
+      - task: DotNetCoreCLI@2
+        displayName: Install Entity Framework CLI
+        inputs:
+          command: custom
+          custom: tool
+          arguments: restore
+
+      - task: DotNetCoreCLI@2
+        displayName: Restore NuGet packages
+        inputs:
+          command: 'restore'
+          feedsToUse: 'select'
+          vstsFeed: '/6357b832-3751-4599-9f60-fb7894b2f4e4'
+          projects: '*/*.csproj'
+          verbosityRestore: 'normal'
+      
+      - task: DotNetCoreCLI@2
+        displayName: Build .NET Projects
+        inputs:
+          command: 'build'
+          projects: '*/*.csproj'
+          arguments: "--configuration $(buildConfiguration)"
+
+      - task: DotNetCoreCLI@2
+        displayName: Run .NET Tests
+        inputs:
+          command: 'test'
+          projects: '**/Core.Tests.csproj'
+          arguments: '--configuration $(buildConfiguration) --no-build'
+
+      - task: PublishTestResults@2
+        inputs:
+            testResultsFormat: VSTest
+            testResultsFiles: '$(Agent.TempDirectory)/*.trx'
+            testRunTitle: 'Tests'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'Publish Functions'
+        inputs:
+          command: 'publish'
+          projects: '**/Functions/Functions.csproj'
+          arguments: '--configuration Release --no-build --output $(Build.ArtifactStagingDirectory)/Functions'
+          publishWebProjects: false
+
+      - task: DotNetCoreCLI@2
+        displayName: Publish Web App
+        inputs:
+          command: 'publish'
+          projects: '**/Web/Web.csproj'
+          arguments: '--configuration $(buildConfiguration) --no-build --output $(Build.ArtifactStagingDirectory)/Web'
+          publishWebProjects: false
+
+      - task: DotNetCoreCLI@2
+        displayName: Create EF Core migration script (ClaimContext)
+        inputs:
+          command: 'custom'
+          custom: 'ef'
+          arguments: ' migrations script -p Core -s Web -c ClaimContext -i -o $(Build.ArtifactStagingDirectory)/ODE.CIP-Migrations-ClaimContext.sql'
+
+      - task: DotNetCoreCLI@2
+        displayName: Create EF Core migration script (FlightOpsContext)
+        inputs:
+          command: 'custom'
+          custom: 'ef'
+          arguments: ' migrations script -p Core -s Web -c FlightOpsContext -i -o $(Build.ArtifactStagingDirectory)/ODE.CIP-Migrations-FlightOpsContext.sql'
+
+      - task: DotNetCoreCLI@2
+        displayName: Create EF Core migration script (ItineraryContext)
+        inputs:
+          command: 'custom'
+          custom: 'ef'
+          arguments: ' migrations script -p Core -s Web -c ItineraryContext -i -o $(Build.ArtifactStagingDirectory)/ODE.CIP-Migrations-ItineraryContext.sql'
+
+      - publish: $(Build.ArtifactStagingDirectory)
+        displayName: 'Publish Build Artifacts'
+        artifact: PCAT
+
+- stage: Deploy
+  dependsOn: 'Build'
+  condition: and(succeeded('Build'), in(variables['Build.SourceBranch'], 'refs/heads/develop', 'refs/heads/release', 'refs/heads/master'))
+  variables:
+    ${{ if and(ne(variables['Build.SourceBranch'], 'refs/heads/release'), ne(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+      environment: SIT
+      serviceConnection: ACAZ-NONPRD-ODE-CIP-DEV
+      webAppName: acode-pcat-sit
+      functionsAppName: fap-cac-pcat-dev
+      sqlServerName: sql-odh-dev-001.database.windows.net
+    ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/release') }}:
+      environment: UAT
+      serviceConnection: SC-rg.ode.cip.uat.acit.canadacentral
+      webAppName: acode-pcat-uat
+      functionsAppName: fap-cac-pcat-uat
+      sqlServerName: sql-odh-uat-001.database.windows.net
+    ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+      environment: PRD
+      serviceConnection: ODE CIP PRD
+      webAppName: acode-pcat-prd
+      functionsAppName: fap-cac-pcat-prd
+      sqlServerName: sql-ode-cip-prd-acit-canadacentral.database.windows.net
+      databaseUser: acadmin
+      sqlDatabasePassword: '$(databasePassword)'
+  jobs:
+  - deployment: Deploy
+    pool:
+      vmImage: 'windows-2019'
+    environment: ${{ variables.environment }}
+    timeoutInMinutes: 0 
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureAppServiceManage@0
+            displayName: 'Stop App Service'
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              action: 'Stop Azure App Service'
+              webAppName: ${{variables.webAppName}}
+
+          - task: AzureRmWebAppDeployment@4
+            displayName: 'Deploy App Service'
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              WebAppName: ${{variables.webAppName}}
+              package: $(Pipeline.Workspace)/PCAT/Web/Web.zip
+
+          - task: AzureAppServiceManage@0
+            displayName: 'Start App Service'
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              action: 'Start Azure App Service'
+              webAppName: ${{variables.webAppName}}
+
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Azure SQL - EF Core migration (ClaimContext)'
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              ServerName: ${{variables.sqlServerName}}
+              DatabaseName: pcat
+              ${{ if and(ne(variables['Build.SourceBranch'], 'refs/heads/release'), ne(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+                authenticationType: servicePrincipal
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/release') }}:
+                authenticationType: servicePrincipal
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+                authenticationType: server
+                SqlUsername: ${{variables.databaseUser}}
+                SqlPassword: ${{variables.sqlDatabasePassword}}              
+              deployType: SqlTask
+              SqlFile: $(Pipeline.Workspace)/PCAT/ODE.CIP-Migrations-ClaimContext.sql
+
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Azure SQL - EF Core migration (FlightOpsContext)'
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              ServerName: ${{variables.sqlServerName}}
+              DatabaseName: fops
+              ${{ if and(ne(variables['Build.SourceBranch'], 'refs/heads/release'), ne(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+                authenticationType: servicePrincipal
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/release') }}:
+                authenticationType: servicePrincipal
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+                authenticationType: server
+                SqlUsername: ${{variables.databaseUser}}
+                SqlPassword: ${{variables.sqlDatabasePassword}}              
+              deployType: SqlTask
+              SqlFile: $(Pipeline.Workspace)/PCAT/ODE.CIP-Migrations-FlightOpsContext.sql
+
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Azure SQL - EF Core migration (ItineraryContext)'
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              ServerName: ${{variables.sqlServerName}}
+              DatabaseName: itinerary
+              ${{ if and(ne(variables['Build.SourceBranch'], 'refs/heads/release'), ne(variables['Build.SourceBranch'], 'refs/heads/master')) }}:
+                authenticationType: servicePrincipal
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/release') }}:
+                authenticationType: servicePrincipal
+              ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+                authenticationType: server
+                SqlUsername: ${{variables.databaseUser}}
+                SqlPassword: ${{variables.sqlDatabasePassword}}              
+              deployType: SqlTask
+              SqlFile: $(Pipeline.Workspace)/PCAT/ODE.CIP-Migrations-ItineraryContext.sql
+
+          - task: AzureAppServiceManage@0
+            displayName: 'Stop Functions'
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              action: 'Stop Azure App Service'
+              webAppName: ${{variables.functionsAppName}}
+
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy Functions'
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              appType: functionApp
+              appName: ${{variables.functionsAppName}}
+              package: '$(Pipeline.Workspace)/PCAT/Functions/Functions.zip'
+              deploymentMethod: runFromPackage
+
+          - task: AzureAppServiceManage@0
+            displayName: 'Start Functions'
+            inputs:
+              azureSubscription: ${{variables.serviceConnection}}
+              action: 'Start Azure App Service'
+              webAppName: ${{variables.functionsAppName}}
+
+          - task: PowerShell@2
+            displayName: 'Check Health'
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                Start-Sleep -s 60
+                $response = Invoke-WebRequest -Uri https://$(webAppName).azurewebsites.net/api/health -Method Get
+                if ($response.StatusCode -ne 200) {
+                  throw
+                }
